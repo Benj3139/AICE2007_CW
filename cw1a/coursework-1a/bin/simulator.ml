@@ -210,7 +210,6 @@ let write_operand (m:mach) (op:operand) (v:quad) : unit =
     - update the registers and/or memory appropriately
     - set the condition flags
 *)
-(* failwith "step unimplemented" *)
 
 (* helper: fetch instruction *)
 let fetch (m:mach) : ins =
@@ -355,12 +354,17 @@ let step (m:mach) : unit =
 
             (*compare two MSBs, only change OF appropriately if shift=1*)
             if shift=1 then (
+                (*shifts MSB into first bit*)
                 let msb = Int64.shift_right_logical v 63 in
-                let second_msb = Int64.shift_right_logical v 62 in
+                (*shifts 2nd MSB into first bit, second bit contains MSB still*)
+                let msb_pair = Int64.shift_right_logical v 62 in
+                (*mask required to extract only 2nd MSB*)
+                let second_msb = Int64.logand msb_pair 1L in
                 (*OF flag -> 0 if msb=second_msb*)
                 m.flags.fo <- (msb<>second_msb)
             )
-        )
+        );
+        m.regs.(rind Rip) <- rip_next
     (* Bitwise right shift *)
     | Shrq, [amt; dest] ->
         let shift = get_shift_amount m amt in
@@ -377,7 +381,8 @@ let step (m:mach) : unit =
                 (*OF flag -> initial MSB*)
                 m.flags.fo <- (Int64.shift_right_logical v 63 = 1L)
             )
-        )
+        );
+        m.regs.(rind Rip) <- rip_next
     (*Set byte*)
     | Set c, [dest] ->
         let cond = interp_cnd m.flags c in
