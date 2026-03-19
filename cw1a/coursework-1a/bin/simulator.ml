@@ -489,8 +489,142 @@ exception Redefined_sym of lbl
 
   HINT: List.fold_left and List.fold_right are your friends.
  *)
-let assemble (p:prog) : exec =
-failwith "assemble unimplemented"
+
+ let assemble (p: prog) : exec =
+  let text_pos = mem_bot in
+
+  (*Pass 1*)
+
+  let symbol_table = Hashtbl.create 16 in
+
+  (* helper to compute size of an element *)
+  let elem_size (e: elem) : int64 =
+    match e.asm with
+    | Text ins_list ->
+        Int64.of_int (List.length ins_list) |> Int64.mul ins_size
+    | Data data_list ->
+        let size_of_data (d:data) =
+          match d with
+          | Quad _ -> 8
+          | Asciz s -> String.length s + 1
+        in
+        Int64.of_int (List.fold_left
+                        (fun acc d -> acc + size_of_data d)
+                        0 data_list)
+  in
+
+  (* compute total text size *)
+  let text_size =
+    List.fold_left
+      (fun acc e ->
+        match e.asm with
+        | Text _ -> Int64.add acc (elem_size e)
+        | Data _ -> acc)
+      0L p
+  in
+
+  let data_pos = Int64.add text_pos text_size in
+
+  (* now walk again to build symbol table *)
+  let curr_text = ref text_pos in
+  let curr_data = ref data_pos in
+
+  List.iter
+    (fun e ->
+      if Hashtbl.mem symbol_table e.lbl
+      then failwith "duplicate label";
+
+      Hashtbl.add symbol_table e.lbl
+        (match e.asm with
+         | Text _ -> !curr_text
+         | Data _ -> !curr_data);
+
+      match e.asm with
+      | Text ins_list ->
+          curr_text :=
+            Int64.add !curr_text
+              (Int64.mul ins_size
+                 (Int64.of_int (List.length ins_list)))
+      | Data data_list ->
+          let size_of_data = function
+            | Quad _ -> 8
+            | Asciz s -> String.length s + 1
+          in
+          let total =
+            List.fold_left
+              (fun acc d -> acc + size_of_data d)
+              0 data_list
+          in
+          curr_data :=
+            Int64.add !curr_data (Int64.of_int total))
+    p;
+
+  (* ensure main exists *)
+  
+  if not (Hashtbl.mem symbol_table "main")
+  then raise (Undefined_sym "main");
+
+
+  let entry = Hashtbl.find symbol_table "main" in
+
+  (* Pass 2 *)
+
+  let text_seg = ref [] in
+  let data_seg = ref [] in
+
+  List.iter
+    (fun e ->
+      match e.asm with
+      | Text ins_list ->
+          List.iter
+            (fun ins ->
+              let resolved_ins =
+                let op, args = ins in
+                let resolve_operand = function
+                  | Imm (Lbl l) ->
+                      if not (Hashtbl.mem symbol_table l)
+                      then raise (Undefined_sym l)
+                      else Imm (Lit (Hashtbl.find symbol_table l))
+                  | Ind1 (Lbl l) ->
+                      if not (Hashtbl.mem symbol_table l)
+                      then raise (Undefined_sym l)
+                      else Ind1 (Lit (Hashtbl.find symbol_table l))
+                  | Ind3 (Lbl l, r) ->
+                      if not (Hashtbl.mem symbol_table l)
+                      then raise (Undefined_sym l)
+                      else Ind3 (Lit (Hashtbl.find symbol_table l), r)
+                  | other -> other
+                in
+                (op, List.map resolve_operand args)
+              in
+              text_seg := !text_seg @ sbytes_of_ins resolved_ins)
+            ins_list
+      | Data data_list ->
+          List.iter
+            (fun d ->
+              match d with
+              | Quad (Lbl l) ->
+                  if not (Hashtbl.mem symbol_table l)
+                  then raise (Undefined_sym l)
+                  else
+                    data_seg :=
+                      !data_seg @
+                      sbytes_of_int64
+                        (Hashtbl.find symbol_table l)
+              | _ ->
+                  data_seg := !data_seg @ sbytes_of_data d)
+            data_list)
+    p;
+
+  (* Return executable *)
+
+  {
+    entry;
+    text_pos;
+    data_pos;
+    text_seg = !text_seg;
+    data_seg = !data_seg;
+  }
 
 (* Convert an object file into an executable machine state. 
     - allocate the mem array
@@ -505,5 +639,41 @@ failwith "assemble unimplemented"
   Hint: The Array.make, Array.blit, and Array.of_list library functions 
   may be of use.
 *)
-let load {entry; text_pos; data_pos; text_seg; data_seg} : mach = 
-failwith "load unimplemented"
+let load (exec : exec) : mach =
+  (* 1. Allocate memory for 64K *)
+  let mem = Array.make mem_size InsFrag in
+
+  (* 2. Helper to copy a segment into memory *)
+  let copy_segment seg addr =
+    let base = Int64.to_int (Int64.sub addr mem_bot) in
+    List.iteri (fun i b -> mem.(base + i) <- b) seg
+  in
+
+  (* 3. Copy text and data segments to their load addresses *)
+  copy_segment exec.text_seg exec.text_pos;
+  copy_segment exec.data_seg exec.data_pos;
+
+(* 4. Initialize registers *)
+let regs = Array.make nregs 0L in
+let rsp_index = 7  (* check: Rsp index in your rind function *) in
+let rip_index = 16 in
+(* Push exit_addr at top of stack *)
+let exit_bytes = sbytes_of_int64 exit_addr in
+let rsp_start = Int64.sub mem_top 8L in
+regs.(rsp_index) <- rsp_start;
+List.iteri (fun i b ->
+    let idx = Int64.to_int (Int64.sub rsp_start mem_bot) + i in
+    mem.(idx) <- b
+) exit_bytes;
+
+regs.(rip_index) <- exec.entry;     (* %rip starts at entry point *)
+
+  (* 5. Optionally, put the exit sentinel at top of stack *)
+  (* For your simulator, it may just check regs(%rip) = exit_addr, 
+     so you might not need to write it into memory. *)
+  (* mem.(mem_size - 1) <- ... *)
+
+  (* 6. Initialize flags *)
+  let flags = { fo = false; fs = false; fz = false } in
+
+  { flags; regs; mem }
