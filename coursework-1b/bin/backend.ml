@@ -317,9 +317,6 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
 
       | Alloca _ ->
           let dest = lookup ctxt.layout uid in
-          (*[]*)
-          
-          
           let r = Reg Rax in
 
           begin match dest with
@@ -331,65 +328,27 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
               failwith "compile_insn: Alloca unexpected operand form"
           end
           
-          
-
       | Store (_, op_val, op_ptr) ->
           let r_val = Reg Rax in
           let r_ptr = Reg Rbx in
           
           let code_val = compile_operand ctxt r_val op_val in
           let code_ptr = compile_operand ctxt r_ptr op_ptr in
-          
-          (*if pointer is a memory reference, store via temporary register*)
-          (*
-          let store_instr = match r_ptr with
-              | Reg _ -> [(Movq, [r_val; Ind2 Rbx])]
-              | _ ->
-                  let tmp = Reg Rcx in 
-                  [(Movq, [r_val; tmp]); (Movq, [tmp; Ind2 Rbx])]
-          in
-          *)
-          (*store_instr = [(Movq, [r_val; Ind2 r_ptr])] in*)
 
           code_val @ code_ptr @ [(Movq, [r_val; Ind2 Rbx])]
-          (*
-          let dst = match op_ptr with
-              | Id uid -> lookup ctxt.layout uid
-              | Gid gid -> Ind3 (Lbl (Platform.mangle gid), Rip)
-              | _ -> failwith "Store: unexpected pointer"
-          in
-
-          code_val @ [(Movq, [r_val; dst])]
-          *)
 
       | Load (_, op_ptr) ->
+          let dest = lookup ctxt.layout uid in
           let r_ptr = Reg Rax in
+          let r_val = Reg Rbx in
           let code_ptr = compile_operand ctxt r_ptr op_ptr in
-          let dest = lookup ctxt.layout uid in
-          (*let code_ptr = compile_operand ctxt r_tmp op_ptr in*)
-          code_ptr @ [(Movq, [Ind2 Rax; dest])]
           
-          (*
-          let r_val = Reg Rax in
-          let src = match op_ptr with
-              | Id uid -> lookup ctxt.layout uid
-              | Gid gid -> Ind3 (Lbl (Platform.mangle gid), Rip)
-              | _ -> failwith "Load: unexpected pointer"
-          in
-          [(Movq, [src; r_val])]
-          *)
-
-          (*
-          let dest = lookup ctxt.layout uid in
-          let r_val = Reg Rax in
-          let r_ptr = Reg Rbx in
-
-          (compile_operand ctxt r_ptr op) @ 
-          [(Movq, [Ind2 Rbx; r_val]); (Movq, [r_val; dest])]
-          *)
-
+          code_ptr @ [
+              (Movq, [Reg Rax; r_val]);
+              (Movq, [r_val; dest])
+          ]
+          
       | Call (ret_ty, fn, args) ->
-
           let arg_moves = List.flatten(List.mapi (fun i (_,op) ->
                 let dst = arg_loc i in
                 compile_operand ctxt dst op
