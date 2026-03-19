@@ -6,7 +6,7 @@ open Gradedtests
 let mk_insertion_sort_prog (a0 : int64) (a1 : int64) (a2 : int64) (a3 : int64) (a4 : int64) : prog =
   [
     { lbl = "main"; global = true; asm = Text [
-        (* Allocate 5 qwords on the stack and initialize array *)
+        (* allocate 5 qwords on the stack and initialize array *)
         (Subq, [Imm (Lit 40L); Reg Rsp]);
         (Movq, [Imm (Lit a0); Ind3 (Lit 0L, Rsp)]);
         (Movq, [Imm (Lit a1); Ind3 (Lit 8L, Rsp)]);
@@ -118,6 +118,38 @@ let run_and_expect_sorted (label : string) (p : prog) : unit =
   if r <> 1L then
     failwith (Printf.sprintf "%s failed: got %Ld, expected 1" label r)
 
+let read_quad_at (m : mach) (addr : int64) : int64 =
+  match map_addr addr with
+  | None -> failwith "read_quad_at: address out of bounds"
+  | Some i ->
+      let bs = Array.to_list (Array.sub m.mem i 8) in
+      int64_of_sbytes bs
+
+let check_sorted_base_case_machine () : unit =
+  let exec = assemble insertion_sort_prog in
+  let mach = load exec in
+  let initial_rsp = mach.regs.(rind Rsp) in
+  ignore (run mach);
+
+  let actual =
+    [ read_quad_at mach (Int64.add initial_rsp (-40L))
+    ; read_quad_at mach (Int64.add initial_rsp (-32L))
+    ; read_quad_at mach (Int64.add initial_rsp (-24L))
+    ; read_quad_at mach (Int64.add initial_rsp (-16L))
+    ; read_quad_at mach (Int64.add initial_rsp (-8L))
+    ]
+  in
+
+  let expected = [1L; 2L; 4L; 5L; 6L] in
+  if actual <> expected then
+    failwith
+      (Printf.sprintf
+         "sorted array mismatch: got [%Ld; %Ld; %Ld; %Ld; %Ld], expected [%Ld; %Ld; %Ld; %Ld; %Ld]"
+         (List.nth actual 0) (List.nth actual 1) (List.nth actual 2)
+         (List.nth actual 3) (List.nth actual 4)
+         (List.nth expected 0) (List.nth expected 1) (List.nth expected 2)
+         (List.nth expected 3) (List.nth expected 4))
+
 let provided_tests : suite = [
   Test ("Insertion sort program tests", [
     "sorts [5;2;4;6;1]", (fun () -> run_and_expect_sorted "base case" insertion_sort_prog);
@@ -125,5 +157,6 @@ let provided_tests : suite = [
     "sorts reverse [9;7;5;3;1]", (fun () -> run_and_expect_sorted "reverse sorted case" insertion_sort_reverse_prog);
     "sorts duplicates [3;1;3;2;1]", (fun () -> run_and_expect_sorted "duplicates case" insertion_sort_duplicates_prog);
     "sorts negatives [-2;4;0;-5;3]", (fun () -> run_and_expect_sorted "negatives case" insertion_sort_with_negatives_prog);
+    "machine-checks [5;2;4;6;1] into [1;2;4;5;6]", check_sorted_base_case_machine;
   ]);
 ]

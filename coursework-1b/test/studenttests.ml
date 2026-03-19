@@ -8,5 +8,7 @@ open Gradedtests
 (* debug your program.                                          *)
 
 let provided_tests : suite = [
-  
+    Test ("my custom LLVMlite test", fun () ->
+    run_file "llprograms/interestingtestcase.ll"
+  );
 ] 

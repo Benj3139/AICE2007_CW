@@ -475,6 +475,7 @@ exception Undefined_sym of lbl
 (* Assemble should raise this when a label is defined more than once *)
 exception Redefined_sym of lbl
 
+(* PART II TASK 1 *)
 (* Convert an X86 program into an object file:
    - separate the text and data segments
    - compute the size of each segment
@@ -489,7 +490,6 @@ exception Redefined_sym of lbl
 
   HINT: List.fold_left and List.fold_right are your friends.
  *)
-
  let assemble (p: prog) : exec =
   let text_pos = mem_bot in
 
@@ -525,7 +525,7 @@ exception Redefined_sym of lbl
 
   let data_pos = Int64.add text_pos text_size in
 
-  (* now walk again to build symbol table *)
+  (* walk again to build symbol table *)
   let curr_text = ref text_pos in
   let curr_data = ref data_pos in
 
@@ -567,7 +567,7 @@ exception Redefined_sym of lbl
 
   let entry = Hashtbl.find symbol_table "main" in
 
-  (* Pass 2 *)
+  (* pass 2 *)
 
   let text_seg = ref [] in
   let data_seg = ref [] in
@@ -639,25 +639,28 @@ exception Redefined_sym of lbl
   Hint: The Array.make, Array.blit, and Array.of_list library functions 
   may be of use.
 *)
+
+(* PART II TASK 2 *)
 let load (exec : exec) : mach =
-  (* 1. Allocate memory for 64K *)
+  (* allocate memory for 64K *)
   let mem = Array.make mem_size InsFrag in
 
-  (* 2. Helper to copy a segment into memory *)
+  (* helper to copy a segment into memory *)
   let copy_segment seg addr =
     let base = Int64.to_int (Int64.sub addr mem_bot) in
     List.iteri (fun i b -> mem.(base + i) <- b) seg
   in
 
-  (* 3. Copy text and data segments to their load addresses *)
+  (* copy text and data segments to their load addresses *)
   copy_segment exec.text_seg exec.text_pos;
   copy_segment exec.data_seg exec.data_pos;
 
-(* 4. Initialize registers *)
+(* initialize registers *)
 let regs = Array.make nregs 0L in
 let rsp_index = 7  (* check: Rsp index in your rind function *) in
 let rip_index = 16 in
-(* Push exit_addr at top of stack *)
+
+(* push exit_addr at top of stack *)
 let exit_bytes = sbytes_of_int64 exit_addr in
 let rsp_start = Int64.sub mem_top 8L in
 regs.(rsp_index) <- rsp_start;
@@ -668,12 +671,5 @@ List.iteri (fun i b ->
 
 regs.(rip_index) <- exec.entry;     (* %rip starts at entry point *)
 
-  (* 5. Optionally, put the exit sentinel at top of stack *)
-  (* For your simulator, it may just check regs(%rip) = exit_addr, 
-     so you might not need to write it into memory. *)
-  (* mem.(mem_size - 1) <- ... *)
 
-  (* 6. Initialize flags *)
-  let flags = { fo = false; fs = false; fz = false } in
-
-  { flags; regs; mem }
+  let flags = { fo = false; fs = false; fz = false } in{ flags; regs; mem }
