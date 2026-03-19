@@ -91,25 +91,40 @@ let lookup m x = List.assoc x m
    the X86 instruction that moves an LLVM operand into a designated
    destination (usually a register).
 *)
-let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> ins list = 
+let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> X86.ins list =
     function
-    (*finds stack slot of %uid using layout, loads stack value into dest*)
-    | Id uid -> 
+    | Id uid ->
         let src = lookup ctxt.layout uid in
         begin match src, dest with
-            | Reg _, Reg _ -> [(Movq, [src;dest])]
-            | Reg _, Ind3 _ -> [(Movq, [src;dest])]
-            | Ind3 _, Reg _ -> [(Movq, [src;dest])]
-            | Ind3 _, Ind3 _ ->
-                let tmp = Reg Rax in
-                [(Movq, [src;tmp]); (Movq, [tmp;dest])]
+        | Reg _, Reg _
+        | Reg _, Ind1 _
+        | Reg _, Ind2 _
+        | Reg _, Ind3 _ -> [(Movq, [src; dest])]
+
+        | Ind1 _, Reg _
+        | Ind2 _, Reg _
+        | Ind3 _, Reg _ -> [(Movq, [src; dest])]
+
+        | Ind1 _, Ind1 _
+        | Ind1 _, Ind2 _
+        | Ind1 _, Ind3 _
+        | Ind2 _, Ind1 _
+        | Ind2 _, Ind2 _
+        | Ind2 _, Ind3 _
+        | Ind3 _, Ind1 _
+        | Ind3 _, Ind2 _
+        | Ind3 _, Ind3 _ ->
+            let tmp = Reg Rax in
+            [(Movq, [src; tmp]); (Movq, [tmp; dest])]
+
+        | _, _ -> failwith "compile_operand: unexpected src/dest"
         end
-    (*loads address of gid (a global variable) into dest*)
-    | Gid gid -> [(Leaq, [Ind3 (Lbl (Platform.mangle gid), Rip); dest])]
-    (*moves integer literal into dest*)
-    | Const c -> [(Movq, [Imm (Lit c); dest])]
-    (*moves null pointer (0) into dest*)
-    | Null -> [(Movq, [Imm (Lit 0L); dest])]
+
+  | Gid gid -> [(Leaq, [Ind3 (Lbl (Platform.mangle gid), Rip); dest])]
+
+  | Const c -> [(Movq, [Imm (Lit c); dest])]
+
+  | Null -> [(Movq, [Imm (Lit 0L); dest])]
 
 
 
@@ -317,37 +332,51 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
 
       | Alloca _ ->
           let dest = lookup ctxt.layout uid in
-          let r = Reg Rax in
+          let r = Rax in
 
           begin match dest with
           | Ind3 (Lit offset, Rbp) -> [
-                (Leaq, [Ind3 (Lit offset, Rbp); r]);
-                (Movq, [r; dest])
+                (Leaq, [Ind3 (Lit offset, Rbp); Reg r]);
+                (Movq, [Reg r; dest])
             ]
           | _ ->
               failwith "compile_insn: Alloca unexpected operand form"
           end
           
       | Store (_, op_val, op_ptr) ->
-          let r_val = Reg Rax in
-          let r_ptr = Reg Rbx in
+          let r_val = Rax in
+          let r_ptr = Rbx in
           
-          let code_val = compile_operand ctxt r_val op_val in
-          let code_ptr = compile_operand ctxt r_ptr op_ptr in
+          let code_val = compile_operand ctxt (Reg r_val) op_val in
+          let code_ptr = compile_operand ctxt (Reg r_ptr) op_ptr in
 
-          code_val @ code_ptr @ [(Movq, [r_val; Ind2 Rbx])]
+          code_val @ code_ptr @ [(Movq, [Reg r_val; Ind2 r_ptr])]
+          (*
+          begin match op_ptr with
+          | Gid _ -> code_val @ code_ptr @ [(Movq, [Reg r_val; Ind2 r_ptr])]
+          | Id _ -> code_val @ code_ptr @ [(Movq, [Reg r_val; Ind2 r_ptr])]
+          | _ -> failwith "Store: unsupported operand"
+          end
+          *)
 
       | Load (_, op_ptr) ->
           let dest = lookup ctxt.layout uid in
-          let r_ptr = Reg Rax in
-          let r_val = Reg Rbx in
-          let code_ptr = compile_operand ctxt r_ptr op_ptr in
+          let r_ptr = Rax in
+          let r_val = Rbx in
+          let code_ptr = compile_operand ctxt (Reg r_ptr) op_ptr in
           
-          code_ptr @ [
-              (Movq, [Reg Rax; r_val]);
-              (Movq, [r_val; dest])
-          ]
+          begin match op_ptr with
+          | Gid _ ->
+              code_ptr @ [
+                  (Movq, [Ind2 r_ptr; Reg r_val]);
+                  (Movq, [Reg r_val; dest])
+              ]
+          | Id _ -> code_ptr @ [(Movq, [Reg r_ptr; dest])]
+          | _ -> failwith "Load: unsupported operand"
+          end
           
+          
+      (*
       | Call (ret_ty, fn, args) ->
           let arg_moves = List.flatten(List.mapi (fun i (_,op) ->
                 let dst = arg_loc i in
@@ -368,6 +397,51 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           in
 
           arg_moves @ call_insn @ ret_code
+      *)
+      | Call (ret_ty, fn, args) ->
+          let indexed_args = List.mapi (
+              fun i arg -> (i, arg)
+          ) args in
+
+          let (reg_args, stack_args) =
+              List.partition (fun (i, _) -> i < 6) indexed_args
+          in
+
+          let reg_moves = List.flatten (List.map (
+              fun (i, (_, op)) ->
+                  let dst = arg_loc i in
+                  compile_operand ctxt dst op
+              ) reg_args
+          ) in
+
+          let stack_pushes =
+              List.rev stack_args
+              |> List.map (fun (_, (_, op)) ->
+                  let r = Reg Rax in
+                  (compile_operand ctxt r op) @ [(Pushq, [r])]
+              )
+              |> List.flatten
+          in
+
+          let call_insn = match fn with
+              | Gid gid -> [(Callq, [Imm (Lbl (Platform.mangle gid))])]
+              | _ -> failwith "Call: only global functions supported"
+          in
+
+          let stack_cleanup =
+              let n = List.length stack_args in
+              if n = 0 then []
+              else [(Addq, [Imm (Lit (Int64.of_int (8 * n))); Reg Rsp])]
+          in
+
+          let ret_code = match ret_ty with
+              | Void -> []
+              | _ ->
+                  let dest = lookup ctxt.layout uid in
+                  [(Movq, [Reg Rax; dest])]
+          in
+
+          reg_moves @ stack_pushes @ call_insn @ stack_cleanup @ ret_code
 
       | Bitcast (_, op, _) ->
           let dest = lookup ctxt.layout uid in
