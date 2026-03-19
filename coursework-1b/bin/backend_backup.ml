@@ -205,16 +205,7 @@ let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> X86.ins list 
      Your function should simply return 0 in those cases
 *)
 let rec size_ty (tdecls:(tid * ty) list) (t:Ll.ty) : int =
-  match t with
-  | I1 | I64 | Ptr _ -> 8
-  | Struct ts -> List.fold_left (fun acc ty -> acc + size_ty tdecls ty) 0 ts
-  | Array (n, ty) -> n * size_ty tdecls ty
-  | Namedt id ->
-      begin match List.assoc_opt id tdecls with
-      | Some ty -> size_ty tdecls ty
-      | None -> 0
-      end
-  | Void | I8 | Fun _ -> 0
+failwith "size_ty not implemented"
 
 
 
@@ -244,62 +235,8 @@ let rec size_ty (tdecls:(tid * ty) list) (t:Ll.ty) : int =
       in (4), but relative to the type f the sub-element picked out
       by the path so far
 *)
-
 let compile_gep (ctxt:ctxt) (op : Ll.ty * Ll.operand) (path: Ll.operand list) : ins list =
-    let base_ty, base_op = op in
-    let rec resolve_named = function
-        | Namedt id ->
-            begin match List.assoc_opt id ctxt.tdecls with
-            | Some ty -> resolve_named ty
-            | None -> Namedt id
-            end
-        | t -> t
-    in
-
-    let index_code (elem_sz:int) (idx:Ll.operand) : ins list =
-        let r_idx = Reg Rbx in
-        compile_operand ctxt r_idx idx @
-        [
-          (Imulq, [Imm (Lit (Int64.of_int elem_sz)); r_idx]);
-          (Addq, [r_idx; Reg Rax])
-        ]
-    in
-
-    let rec walk (cur_ty:Ll.ty) (idxs:Ll.operand list) : ins list =
-        match idxs with
-        | [] -> []
-        | i::rest ->
-            begin match resolve_named cur_ty with
-            | Struct ts ->
-                begin match i with
-                | Const n ->
-                    let k = Int64.to_int n in
-                    if k < 0 || k >= List.length ts then failwith "compile_gep: bad struct index";
-                    let rec prefix_size n tys =
-                        match n, tys with
-                        | 0, _ | _, [] -> 0
-                        | m, ty::tl -> size_ty ctxt.tdecls ty + prefix_size (m-1) tl
-                    in
-                    let offset = prefix_size k ts in
-                    (if offset = 0 then [] else [(Addq, [Imm (Lit (Int64.of_int offset)); Reg Rax])]) @
-                    walk (List.nth ts k) rest
-                | _ -> failwith "compile_gep: struct index must be constant"
-                end
-            | Array (_, ty) ->
-                index_code (size_ty ctxt.tdecls ty) i @ walk ty rest
-            | _ -> failwith "compile_gep: invalid index path"
-            end
-    in
-
-    match base_ty with
-    | Ptr t ->
-        compile_operand ctxt (Reg Rax) base_op @
-        begin match path with
-        | [] -> []
-        | first::rest ->
-            index_code (size_ty ctxt.tdecls t) first @ walk t rest
-        end
-    | _ -> failwith "compile_gep: base operand is not a pointer"
+failwith "compile_gep not implemented"
 
 
 
@@ -387,8 +324,11 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           (*perform comparison r1-r2*)
           let cmp = [(Cmpq, [r2;r1])] in
 
-          let set_instr = [(Movq, [Imm (Lit 0L); r1]); (Set (compile_cnd cnd), [r1])] in
-                    code1 @ code2 @ cmp @ set_instr @ [(Movq, [r1;dest])]
+          let r08 = Reg R08 in
+          let set_instr = [(Set (compile_cnd cnd), [r08])] in
+          let move_to_r1 = [Movq, [r08;r1]] in
+
+          code1 @ code2 @ cmp @ set_instr @ move_to_r1 @ [(Movq, [r1;dest])]
 
       | Alloca _ ->
           let dest = lookup ctxt.layout uid in
@@ -484,9 +424,8 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           let dest = lookup ctxt.layout uid in
           compile_operand ctxt dest op
 
-      | Gep (ty, op, path) ->
-          let dest = lookup ctxt.layout uid in
-          compile_gep ctxt (ty, op) path @ [(Movq, [Reg Rax; dest])]
+      (*Gep*)
+      
 
       | _ ->
           failwith "compile_insn: instruction not implemented"
