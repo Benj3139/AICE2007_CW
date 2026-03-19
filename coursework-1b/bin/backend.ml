@@ -316,10 +316,10 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           code1 @ code2 @ cmp @ set_instr @ move_to_r1 @ [(Movq, [r1;dest])]
 
       | Alloca _ ->
-          let _dest = lookup ctxt.layout uid in
-          []
+          let dest = lookup ctxt.layout uid in
+          (*[]*)
           
-          (*
+          
           let r = Reg Rax in
 
           begin match dest with
@@ -330,7 +330,7 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           | _ ->
               failwith "compile_insn: Alloca unexpected operand form"
           end
-          *)
+          
           
 
       | Store (_, op_val, op_ptr) ->
@@ -340,9 +340,18 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           let code_val = compile_operand ctxt r_val op_val in
           let code_ptr = compile_operand ctxt r_ptr op_ptr in
           
-          let tmp = Reg Rcx in 
-          code_val @ code_ptr @ [(Movq, [r_val; tmp]); (Movq, [tmp; Ind2 r_ptr])]
+          (*if pointer is a memory reference, store via temporary register*)
+          (*
+          let store_instr = match r_ptr with
+              | Reg _ -> [(Movq, [r_val; Ind2 Rbx])]
+              | _ ->
+                  let tmp = Reg Rcx in 
+                  [(Movq, [r_val; tmp]); (Movq, [tmp; Ind2 Rbx])]
+          in
+          *)
+          (*store_instr = [(Movq, [r_val; Ind2 r_ptr])] in*)
 
+          code_val @ code_ptr @ [(Movq, [r_val; Ind2 Rbx])]
           (*
           let dst = match op_ptr with
               | Id uid -> lookup ctxt.layout uid
@@ -353,9 +362,12 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           code_val @ [(Movq, [r_val; dst])]
           *)
 
-      | Load (uid, op) ->
+      | Load (_, op_ptr) ->
+          let r_ptr = Reg Rax in
+          let code_ptr = compile_operand ctxt r_ptr op_ptr in
           let dest = lookup ctxt.layout uid in
-          compile_operand ctxt dest op
+          (*let code_ptr = compile_operand ctxt r_tmp op_ptr in*)
+          code_ptr @ [(Movq, [Ind2 Rax; dest])]
           
           (*
           let r_val = Reg Rax in
