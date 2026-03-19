@@ -97,15 +97,20 @@ let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> ins list =
     | Id uid -> 
         let src = lookup ctxt.layout uid in
         begin match src, dest with
-            | Reg _, Reg _ -> [(Movq, [src;dest])]
-            | Reg _, Ind3 _ -> [(Movq, [src;dest])]
-            | Ind3 _, Reg _ -> [(Movq, [src;dest])]
-            | Ind3 _, Ind3 _ ->
+            | _, Imm _ -> failwith "compile_operand: immediate destination"
+            | (Ind1 _ | Ind2 _ | Ind3 _), (Ind1 _ | Ind2 _ | Ind3 _) ->
                 let tmp = Reg Rax in
                 [(Movq, [src;tmp]); (Movq, [tmp;dest])]
+            | _ -> [(Movq, [src;dest])]
         end
     (*loads address of gid (a global variable) into dest*)
-    | Gid gid -> [(Leaq, [Ind3 (Lbl (Platform.mangle gid), Rip); dest])]
+        | Gid gid ->
+        begin match dest with
+        | Reg _ -> [(Leaq, [Ind3 (Lbl (Platform.mangle gid), Rip); dest])]
+        | _ ->
+            let tmp = Reg Rax in
+            [(Leaq, [Ind3 (Lbl (Platform.mangle gid), Rip); tmp]); (Movq, [tmp; dest])]
+        end
     (*moves integer literal into dest*)
     | Const c -> [(Movq, [Imm (Lit c); dest])]
     (*moves null pointer (0) into dest*)
@@ -190,7 +195,16 @@ let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> ins list =
      Your function should simply return 0 in those cases
 *)
 let rec size_ty (tdecls:(tid * ty) list) (t:Ll.ty) : int =
-failwith "size_ty not implemented"
+  match t with
+  | I1 | I64 | Ptr _ -> 8
+  | Struct ts -> List.fold_left (fun acc ty -> acc + size_ty tdecls ty) 0 ts
+  | Array (n, ty) -> n * size_ty tdecls ty
+  | Namedt id ->
+      begin match List.assoc_opt id tdecls with
+      | Some ty -> size_ty tdecls ty
+      | None -> 0
+      end
+  | Void | I8 | Fun _ -> 0
 
 
 
@@ -221,7 +235,56 @@ failwith "size_ty not implemented"
       by the path so far
 *)
 let compile_gep (ctxt:ctxt) (op : Ll.ty * Ll.operand) (path: Ll.operand list) : ins list =
-failwith "compile_gep not implemented"
+ let base_ty, base_op = op in
+  let rec resolve_named = function
+    | Namedt id ->
+        begin match List.assoc_opt id ctxt.tdecls with
+        | Some ty -> resolve_named ty
+        | None -> Namedt id
+        end
+    | t -> t
+  in
+  let index_code (elem_sz:int) (idx:Ll.operand) : ins list =
+    let r_idx = Reg Rbx in
+    compile_operand ctxt r_idx idx @
+    [ (Imulq, [Imm (Lit (Int64.of_int elem_sz)); r_idx])
+    ; (Addq, [r_idx; Reg Rax])
+    ]
+  in
+  let rec walk (cur_ty:Ll.ty) (idxs:Ll.operand list) : ins list =
+    match idxs with
+    | [] -> []
+    | i::rest ->
+        begin match resolve_named cur_ty with
+        | Struct ts ->
+            begin match i with
+            | Const n ->
+                let k = Int64.to_int n in
+                if k < 0 || k >= List.length ts then failwith "compile_gep: bad struct index";
+                let rec prefix_size n tys =
+                  match n, tys with
+                  | 0, _ | _, [] -> 0
+                  | m, ty::tl -> size_ty ctxt.tdecls ty + prefix_size (m-1) tl
+                in
+                let offset = prefix_size k ts in
+                (if offset = 0 then [] else [(Addq, [Imm (Lit (Int64.of_int offset)); Reg Rax])]) @
+                walk (List.nth ts k) rest
+            | _ -> failwith "compile_gep: struct index must be constant"
+            end
+        | Array (_, ty) ->
+            index_code (size_ty ctxt.tdecls ty) i @ walk ty rest
+        | _ -> failwith "compile_gep: invalid index path"
+        end
+  in
+  match base_ty with
+  | Ptr t ->
+      compile_operand ctxt (Reg Rax) base_op @
+      begin match path with
+      | [] -> []
+      | first::rest ->
+          index_code (size_ty ctxt.tdecls t) first @ walk t rest
+      end
+  | _ -> failwith "compile_gep: base operand is not a pointer"
 
 
 
@@ -309,11 +372,8 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           (*perform comparison r1-r2*)
           let cmp = [(Cmpq, [r2;r1])] in
 
-          let r08 = Reg R08 in
-          let set_instr = [(Set (compile_cnd cnd), [r08])] in
-          let move_to_r1 = [Movq, [r08;r1]] in
-
-          code1 @ code2 @ cmp @ set_instr @ move_to_r1 @ [(Movq, [r1;dest])]
+          let set_instr = [(Movq, [Imm (Lit 0L); r1]); (Set (compile_cnd cnd), [r1])] in
+                    code1 @ code2 @ cmp @ set_instr @ [(Movq, [r1;dest])]
 
       | Alloca _ ->
           let dest = lookup ctxt.layout uid in
@@ -364,10 +424,10 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
 
       | Load (_, op_ptr) ->
           let r_ptr = Reg Rax in
+          let r_val = Reg R10 in
           let code_ptr = compile_operand ctxt r_ptr op_ptr in
           let dest = lookup ctxt.layout uid in
-          (*let code_ptr = compile_operand ctxt r_tmp op_ptr in*)
-          code_ptr @ [(Movq, [Ind2 Rax; dest])]
+          code_ptr @ [(Movq, [Ind2 Rax; r_val]); (Movq, [r_val; dest])]
           
           (*
           let r_val = Reg Rax in
@@ -389,16 +449,29 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
           *)
 
       | Call (ret_ty, fn, args) ->
+          let reg_args, stack_args =
+            List.mapi (fun i a -> i, a) args
+            |> List.partition (fun (i, _) -> i < 6)
+          in
 
-          let arg_moves = List.flatten(List.mapi (fun i (_,op) ->
-                let dst = arg_loc i in
-                compile_operand ctxt dst op
-                ) args
-          ) in
-
+          let reg_moves =
+            List.flatten (List.map (fun (i, (_, op)) -> compile_operand ctxt (arg_loc i) op) reg_args)
+          in
+          let pushed_stack_args =
+            List.rev stack_args
+            |> List.map (fun (_, (_, op)) ->
+                compile_operand ctxt (Reg Rax) op @ [(Pushq, [Reg Rax])])
+            |> List.flatten
+          in
           let call_insn = match fn with
               | Gid gid -> [Callq, [Imm (Lbl (Platform.mangle gid))]]
-              | _ -> failwith "Call: only global functions supported"
+              | _ -> (compile_operand ctxt (Reg R11) fn) @ [Callq, [Reg R11]]
+          in
+
+          let stack_cleanup =
+            let n = List.length stack_args in
+            if n = 0 then []
+            else [Addq, [Imm (Lit (Int64.of_int (8 * n))); Reg Rsp]]
           in
 
           let ret_code = match ret_ty with
@@ -408,14 +481,16 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
                   [Movq, [Reg Rax; dest]]
           in
 
-          arg_moves @ call_insn @ ret_code
+          reg_moves @ pushed_stack_args @ call_insn @ stack_cleanup @ ret_code
 
       | Bitcast (_, op, _) ->
           let dest = lookup ctxt.layout uid in
           compile_operand ctxt dest op
 
       (*Gep*)
-      
+      | Gep (ty, op, path) ->
+          let dest = lookup ctxt.layout uid in
+          compile_gep ctxt (ty, op) path @ [(Movq, [Reg Rax; dest])]
 
       | _ ->
           failwith "compile_insn: instruction not implemented"
