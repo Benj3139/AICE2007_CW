@@ -38,6 +38,13 @@
   ("var", VAR);
   ("global", GLOBAL);
 
+  (* Added keywords *)
+  ("bool", TBOOL);
+  ("true", TRUE);
+  ("false", FALSE);
+  ("for", FOR);
+  ("new", NEW);
+
   (* Symbols *)
   ( ";", SEMI);
   ( ",", COMMA);
@@ -54,7 +61,20 @@
   ( ")", RPAREN);
   ( "[", LBRACKET);
   ( "]", RBRACKET);
-  
+
+  (* Added symbols *)
+  ("<", LT);
+  ("<=", LE);
+  (">", GT);
+  (">=", GE);
+  ("!=", NEQ);
+  ("&", AMP);
+  ("|", BAR);
+  ("[&]", BITAND);
+  ("[|]", BITOR);
+  (">>>", SAR);
+  ("<<", SHL);
+  (">>", SHR);
   ]
 
 let (symbol_table : (string, Parser.token) Hashtbl.t) = Hashtbl.create 1024
@@ -115,23 +135,21 @@ let hexdigit = ['0'-'9'] | ['a'-'f'] | ['A'-'F']
 
 rule token = parse
   | eof { EOF }
-
   | "/*" { start_lex := start_pos_of_lexbuf lexbuf; comments 0 lexbuf }
   | '"' { reset_str(); start_lex := start_pos_of_lexbuf lexbuf; string false lexbuf }
   | '#' { let p = lexeme_start_p lexbuf in
           if p.pos_cnum - p.pos_bol = 0 then directive 0 lexbuf 
           else raise (Lexer_error (lex_long_range lexbuf,
             Printf.sprintf "# can only be the 1st char in a line.")) }
-
   | lowercase (digit | character | '_')* { create_token lexbuf }
   | digit+ | "0x" hexdigit+ { INT (Int64.of_string (lexeme lexbuf)) }
   | whitespace+ { token lexbuf }
   | newline { newline lexbuf; token lexbuf }
-
-  | ';' | ',' | '{' | '}' | '+' | '-' | '*' | '=' | "==" 
-  | "!=" | '!' | '~' | '(' | ')' | '[' | ']' 
+  | "==" | "!=" | "<=" | ">=" | ">>>" | ">>" | "<<" | "[&]" | "[|]"
+  | ';' | ',' | '{' | '}' | '+' | '-' | '*' | '='  
+  | '!' | '~' | '(' | ')' | '[' | ']'
+  | '&' | '|' | '<' | '>'
     { create_token lexbuf }
-
   | _ as c { unexpected_char lexbuf c }
 
 and directive state = parse
