@@ -368,8 +368,18 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
      expression to implement the SCall statement
  *)
 let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
-  failwith "cmp_stmt not implemented"
-
+  match stmt.elt with
+  | Ret None -> c, [T (Ret (rt,None))]
+  | Ret (Some e) ->
+      let (_, op, code) = cmp_exp c e in
+      (*
+      return a pair of (
+          current context unchanged, 
+          code to compute expression and return result
+      )
+      *)
+      c, code >@ [T (Ret (rt,Some op))]
+  | _ -> failwith "cmp_stmt: only Ret implemented for now"
 
 (* Compile a series of statements *)
 and cmp_block (c:Ctxt.t) (rt:Ll.ty) (stmts:Ast.block) : Ctxt.t * stream =
@@ -394,13 +404,26 @@ let cmp_function_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
     ) c p 
 
 (* Populate a context with bindings for global variables mapping OAT identifiers
-   to LLVMlite gids and their types.
-
-   Only a small subset of OAT expressions can be used as global initializers
-   in well-formed programs. (The constructors starting with C). 
-*)
+   to LLVMlite gids and their types. *)
 let cmp_global_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
-    failwith "cmp_global_ctxt unimplemented"
+  List.fold_left (fun c -> function
+    | Ast.Gvdecl { elt = { name; init } } ->
+      let t =
+        (* 
+          Only a small subset of OAT expressions can be used as global initializers
+          in well-formed programs (The constructors starting with C). Fail rest
+        *)
+        match init.elt with
+        | CNull r -> TRef r
+        | CBool _ -> TBool
+        | CInt _  -> TInt
+        | CStr _  -> TRef RString
+        | CArr (t, _) -> TRef (RArray t)
+        | _ -> failwith "cmp_global_ctxt: invalid global initialiser"
+      in
+      Ctxt.add c name (Ptr (cmp_ty t), Gid name)
+    | _ -> c
+  ) c p
 
 (* Compile a function declaration in global context c. Return the LLVMlite cfg
    and a list of global declarations containing the string literals appearing
@@ -414,7 +437,29 @@ let cmp_global_ctxt (c:Ctxt.t) (p:Ast.prog) : Ctxt.t =
    5. Use cfg_of_stream to produce a LLVMlite cfg from the body
  *)
 let cmp_fdecl (c:Ctxt.t) (f:Ast.fdecl node) : Ll.fdecl * (Ll.gid * Ll.gdecl) list =
-  failwith "cmp_fdecl not implemented"
+    let {frtyp; fname; args; body} = f.elt in
+
+    (*function type*)
+    let arg_tys = List.map (fun (t,_) -> cmp_ty t) args in
+    let ret_ty = cmp_ret_ty frtyp in
+    let fty = (arg_tys,ret_ty) in
+
+    (*parameter names*)
+    let params = List.map snd args in
+
+    (*minimal body: just return default for now*)
+    let code =
+      match ret_ty with
+      | Void -> [T (Ret (Void, None))]
+      | I1 -> [T (Ret (I1, Some (Const 0L)))]
+      | I64 -> [T (Ret (I64, Some (Const 0L)))]
+      | Ptr _ -> [T (Ret (ret_ty, Some Null))]
+      | _ -> failwith "unsupported return type"
+    in
+
+    let cfg, gdecls = cfg_of_stream code in
+
+    ({f_ty=fty; f_param=params; f_cfg=cfg}, gdecls)
 
 
 (* Compile a global initializer, returning the resulting LLVMlite global
@@ -429,7 +474,37 @@ let cmp_fdecl (c:Ctxt.t) (f:Ast.fdecl node) : Ll.fdecl * (Ll.gid * Ll.gdecl) lis
      be an array of pointers to arrays emitted as additional global declarations.
 *)
 let rec cmp_gexp c (e:Ast.exp node) : Ll.gdecl * (Ll.gid * Ll.gdecl) list =
-  failwith "cmp_init not implemented"
+  match e.elt with
+  | CNull r -> (cmp_ty (TRef r), GNull), []
+  | CBool b -> (I1, GInt (if b then 1L else 0L)), []
+  | CInt i -> (I64, GInt i), []
+  | CStr s ->
+      let n = String.length s + 1 in
+      let str_gid = gensym "str" in
+      let str_ty = Array (n, I8) in
+      let str_decl = (str_ty, GString s) in
+      (Ptr I8, GBitcast (Ptr str_ty, GGid str_gid, Ptr I8)), [str_gid, str_decl]
+  | CArr (t, es) ->
+      let ety = cmp_ty t in
+      let compiled = List.map (cmp_gexp c) es in
+      let elem_inits =
+          List.map (fun ((_, ginit), _) -> (ety, ginit)) compiled
+      in
+      let nested_gdecls = List.concat (List.map snd compiled) in
+      let n = List.length es in
+      let arr_storage_ty = Struct [I64; Array (n, ety)] in
+      let arr_storage_init =
+        GStruct [
+          I64, GInt (Int64.of_int n);
+          Array (n, ety), GArray elem_inits
+        ]
+      in
+      let arr_gid = gensym "garr" in
+      let arr_ty = cmp_ty (TRef (RArray t)) in
+      (arr_ty, GBitcast (Ptr arr_storage_ty, GGid arr_gid, arr_ty)),
+      (arr_gid, (arr_storage_ty, arr_storage_init)) :: nested_gdecls
+  | _ ->
+      failwith "cmp_gexp: invalid global initializer"
 
 
 (* Oat internals function context ------------------------------------------- *)

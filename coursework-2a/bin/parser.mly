@@ -53,8 +53,8 @@ let loc (startpos:Lexing.position) (endpos:Lexing.position) (elt:'a) : 'a node =
 %token AMP
 %token BAR
 
-%token BITAND   /*[&]*/
-%token BITOR  /*[|]*/
+%token BITAND  /*[&]*/
+%token BITOR   /*[|]*/
 
 %token SHL
 %token SHR
