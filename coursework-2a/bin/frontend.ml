@@ -347,11 +347,11 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       let ptr = gensym "strptr" in
       Ptr I8, Id ptr,
       [ G (gid, (arr_ty, GString s))
-      ; I (ptr, Gep (arr_ty, Gid gid, [Const 0L; Const 0L])) ]
+      ; I (ptr, Gep (Ptr arr_ty, Gid gid, [Const 0L; Const 0L])) ]
   | Lhs l ->
       let ty, lhs_op, lhs_code = cmp_lhs c l in
       let id = gensym "load" in
-      ty, Id id, lhs_code >@ [I (id, Load (ty, lhs_op))]
+      ty, Id id, lhs_code >@ [I (id, Load (Ptr ty, lhs_op))]
   | CArr (t, es) ->
       let n = List.length es in
       let arr_ty, arr_op, alloc_code = oat_alloc_array t (Const (Int64.of_int n)) in
@@ -361,8 +361,8 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
             let _, eop, ecode = cmp_exp c e in
             let gep_id = gensym "idx" in
             let gep_code =
-              [ I (gep_id, Gep (cmp_rty (RArray t), arr_op, [Const 0L; Const 1L; Const (Int64.of_int i)]))
-              ; I (gensym "store", Store (ety, eop, Id gep_id)) ]
+              [ I (gensym "store", Store (ety, eop, Id gep_id))
+              ; I (gep_id, Gep (cmp_ty (TRef (RArray t)), arr_op, [Const 0L; Const 1L; Const (Int64.of_int i)])) ]
             in
             ecode >@ gep_code
           ) es
@@ -466,7 +466,7 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
       begin match arr_ty with
       | Ptr (Struct [_; Array (_, ety)]) ->
           let gid = gensym "elem" in
-          ety, Id gid, c1 >@ c2 >@ [I (gid, Gep (Struct [I64; Array (0, ety)], arr_op, [Const 0L; Const 1L; idx_op]))]
+          ety, Id gid, c1 >@ c2 >@ [I (gid, Gep (arr_ty, arr_op, [Const 0L; Const 1L; idx_op]))]
       | _ -> failwith "cmp_lhs: indexing non-array"
       end
 
@@ -490,6 +490,17 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
    - you might find it helpful to reuse the code you wrote for the Call
      expression to implement the SCall statement
  *)
+ let rec stmt_always_returns (s:Ast.stmt node) : bool =
+  match s.elt with
+  | Ret _ -> true
+  | If (_, thn, els) -> block_always_returns thn && block_always_returns els
+  | _ -> false
+
+and block_always_returns (b:Ast.block) : bool =
+  match b with
+  | [] -> false
+  | s :: ss -> if stmt_always_returns s then true else block_always_returns ss
+
 let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
   match stmt.elt with
   | Ret None -> c, [T (Ret (rt,None))]
@@ -521,21 +532,35 @@ let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
       let l_end = gensym "ifend" in
       let _, cthen = cmp_block c rt thn in
       let _, celse = cmp_block c rt els in
+      let then_to_else =
+        if block_always_returns thn then [L l_else]
+        else [L l_else; T (Br l_end)]
+      in
+      let else_to_end =
+        if block_always_returns els then [L l_end]
+        else [L l_end; T (Br l_end)]
+      in
       c,
       cc >@
-      [T (Cbr (cop, l_then, l_else)); L l_then] >@
-      cthen >@ [T (Br l_end); L l_else] >@
-      celse >@ [T (Br l_end); L l_end]
+      [L l_then; T (Cbr (cop, l_then, l_else))] >@
+      cthen >@
+      then_to_else >@
+      celse >@
+      else_to_end
   | While (cond, body) ->
       let l_cond = gensym "while_cond" in
       let l_body = gensym "while_body" in
       let l_end = gensym "while_end" in
       let _, cop, cc = cmp_exp c cond in
       let _, cbody = cmp_block c rt body in
-      c, [T (Br l_cond); L l_cond] >@ cc >@
-        [T (Cbr (cop, l_body, l_end)); L l_body] >@
+      let body_to_end =
+        if block_always_returns body then [L l_end]
+        else [L l_end; T (Br l_cond)]
+      in
+      c, [L l_cond; T (Br l_cond)] >@ cc >@
+        [L l_body; T (Cbr (cop, l_body, l_end))] >@
         cbody >@
-        [T (Br l_cond); L l_end]
+        body_to_end
   | For (vdecls, cond_opt, post_opt, body) ->
       let mk_decl (id, e) = Ast.no_loc (Decl (id, e)) in
       let cond = match cond_opt with Some e -> e | None -> Ast.no_loc (CBool true) in
@@ -547,10 +572,19 @@ let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
 
 (* Compile a series of statements *)
 and cmp_block (c:Ctxt.t) (rt:Ll.ty) (stmts:Ast.block) : Ctxt.t * stream =
-  List.fold_left (fun (c, code) s ->
-      let c, stmt_code = cmp_stmt c rt s in
-      c, code >@ stmt_code
-    ) (c,[]) stmts
+  let rec aux (c, code) = function
+    | [] -> c, code
+    | s :: ss ->
+        let c', stmt_code = cmp_stmt c rt s in
+        let code' = code >@ stmt_code in
+        begin match s.elt with
+        | Ret _ -> c', code'
+        | If (_, thn, els) when block_always_returns thn && block_always_returns els
+          -> c', code'
+        | _ -> aux (c', code') ss
+        end
+  in
+  aux (c, []) stmts
 
 
 
