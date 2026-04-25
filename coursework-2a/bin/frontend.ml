@@ -337,10 +337,13 @@ let oat_alloc_array (t:Ast.ty) (size:Ll.operand) : Ll.ty * operand * stream =
 *)
 let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
   match exp.elt with
+  (* Constant expressions compile directly to immediate LLVM operands *)
   | CNull r -> cmp_ty (TRef r), Null, []
   | CBool b -> I1, Const (if b then 1L else 0L), []
   | CInt i -> I64, Const i, []
   | CStr s ->
+      (* Hoist string data to a fresh global [n x i8], then compute i8* to
+         its first character using gep 0,0 *)
       let gid = gensym "str" in
       let n = String.length s + 1 in
       let arr_ty = Array (n, I8) in
@@ -349,10 +352,13 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       [ G (gid, (arr_ty, GString s))
       ; I (ptr, Gep (Ptr arr_ty, Gid gid, [Const 0L; Const 0L])) ]
   | Lhs l ->
+      (* Lhs expressions produce an address, then reading them requires a load *)
       let ty, lhs_op, lhs_code = cmp_lhs c l in
       let id = gensym "load" in
       ty, Id id, lhs_code >@ [I (id, Load (Ptr ty, lhs_op))]
   | CArr (t, es) ->
+          (* Allocate an Oat array, then evaluate each
+         literal element into payload slot i *)
       let n = List.length es in
       let arr_ty, arr_op, alloc_code = oat_alloc_array t (Const (Int64.of_int n)) in
       let ety = cmp_ty t in
@@ -369,9 +375,12 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       in
       arr_ty, arr_op, alloc_code >@ List.flatten stores
   | NewArr (t, e) ->
+    (* Dynamic allocation*)
       let _, sz, csz = cmp_exp c e in
       oat_alloc_array t sz |> fun (ty, op, ca) -> ty, op, csz >@ ca
   | Call (fn, args) ->
+          (* Evaluate actual arguments left-to-right and call to
+         the looked up function operand. *)
       let fty, fop = Ctxt.lookup_function fn c in
       let arg_codes, ll_args =
         List.split (List.map (fun a ->
@@ -390,6 +399,7 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       | _ -> failwith "cmp_exp: call target is not a function"
       end
   | Bop (And, e1, e2) ->
+     (* Boolean and/or are compiled here as i1 binops *)
       let _, o1, c1 = cmp_exp c e1 in
       let _, o2, c2 = cmp_exp c e2 in
       let id = gensym "and" in
@@ -400,6 +410,8 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       let id = gensym "or" in
       I1, Id id, c1 >@ c2 >@ [I (id, Binop (Or, I1, o1, o2))]
   | Bop (b, e1, e2) ->
+          (* For general binary operations, compile both operands, then select the LLVM
+         instruction family based on the Oat operator class *)
       let _, o1, c1 = cmp_exp c e1 in
       let _, o2, c2 = cmp_exp c e2 in
       begin match b with
@@ -423,14 +435,17 @@ let rec cmp_exp (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.operand * stream =
       | _ -> failwith "cmp_exp: unsupported bop"
       end
   | Uop (Neg, e) ->
+    (* Integer negation as 0 - e *)
       let _, o, ce = cmp_exp c e in
       let id = gensym "neg" in
       I64, Id id, ce >@ [I (id, Binop (Sub, I64, Const 0L, o))]
   | Uop (Bitnot, e) ->
+    (* Bitwise not via xor with all ones *)
       let _, o, ce = cmp_exp c e in
       let id = gensym "not" in
       I64, Id id, ce >@ [I (id, Binop (Xor, I64, o, Const (-1L)))]
   | Uop (Lognot, e) ->
+    (* Logical not, compare against false (0) *)
       let _, o, ce = cmp_exp c e in
       let id = gensym "lnot" in
       I1, Id id, ce >@ [I (id, Icmp (Eq, I1, o, Const 0L))]  
@@ -490,9 +505,12 @@ and cmp_lhs (c:Ctxt.t) (l:lhs node) : Ll.ty * Ll.operand * stream =
    - you might find it helpful to reuse the code you wrote for the Call
      expression to implement the SCall statement
  *)
+  (* Control flow helper used to avoid emitting unreachable
+    branches after a statement that must return *)
  let rec stmt_always_returns (s:Ast.stmt node) : bool =
   match s.elt with
   | Ret _ -> true
+  (* An if statement is guaranteed to return when both branches do *)
   | If (_, thn, els) -> block_always_returns thn && block_always_returns els
   | _ -> false
 
@@ -503,6 +521,7 @@ and block_always_returns (b:Ast.block) : bool =
 
 let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
   match stmt.elt with
+  (* Bare return from a void function or rt is already known. *)
   | Ret None -> c, [T (Ret (rt,None))]
   | Ret (Some e) ->
       (*
@@ -514,18 +533,23 @@ let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
       let (_, op, code) = cmp_exp c e in
       c, code >@ [T (Ret (rt,Some op))]
   | Decl (id, e) ->
+          (* Local declarations become stack slots in the entry block and an
+         initializing store of the computed RHS value. *)
       let t, op, code = cmp_exp c e in
       let slot = gensym id in
       let c' = Ctxt.add c id (Ptr t, Id slot) in
       c', code >@ [E (slot, Alloca t); I (gensym "store", Store (t, op, Id slot))]
   | Assn (l, e) ->
+    (* Assignment compiles LHS to an address and RHS to a value, then stores *)
       let t, ptr, cl = cmp_lhs c l in
       let _, op, ce = cmp_exp c e in
       c, cl >@ ce >@ [I (gensym "store", Store (t, op, ptr))]
   | SCall (fn, args) ->
+    (* Call reuses expression call codegen and discards result *)
       let _, _, code = cmp_exp c (Ast.no_loc (Call (fn, args))) in
       c, code
   | If (cond, thn, els) ->
+    (* Structured branch with explicit labels for then, else, and fallthrough *)
       let _, cop, cc = cmp_exp c cond in
       let l_then = gensym "then" in
       let l_else = gensym "else" in
@@ -548,6 +572,7 @@ let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
       celse >@
       else_to_end
   | While (cond, body) ->
+    (* Canonical while loop CFG with condition, body, and end labels *)
       let l_cond = gensym "while_cond" in
       let l_body = gensym "while_body" in
       let l_end = gensym "while_end" in
@@ -562,6 +587,7 @@ let rec cmp_stmt (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt.t * stream =
         cbody >@
         body_to_end
   | For (vdecls, cond_opt, post_opt, body) ->
+    (* Desugar for loop to declarations and while(cond){ body; post } *)
       let mk_decl (id, e) = Ast.no_loc (Decl (id, e)) in
       let cond = match cond_opt with Some e -> e | None -> Ast.no_loc (CBool true) in
       let body' = match post_opt with Some s -> body @ [s] | None -> body in
@@ -675,16 +701,21 @@ let cmp_fdecl (c:Ctxt.t) (f:Ast.fdecl node) : Ll.fdecl * (Ll.gid * Ll.gdecl) lis
 *)
 let rec cmp_gexp c (e:Ast.exp node) : Ll.gdecl * (Ll.gid * Ll.gdecl) list =
   match e.elt with
+  (* Simple constants map directly to LLVM global initializers *)
   | CNull r -> (cmp_ty (TRef r), GNull), []
   | CBool b -> (I1, GInt (if b then 1L else 0L)), []
   | CInt i -> (I64, GInt i), []
   | CStr s ->
+         (* Global strings are emitted as separate [n x i8] globals and referenced
+         through a bitcast to i8* in the owning global initializer *)
       let n = String.length s + 1 in
       let str_gid = gensym "str" in
       let str_ty = Array (n, I8) in
       let str_decl = (str_ty, GString s) in
       (Ptr I8, GBitcast (Ptr str_ty, GGid str_gid, Ptr I8)), [str_gid, str_decl]
   | CArr (t, es) ->
+          (* Global arrays use the Oat runtime layout and
+         evaluate nested constant initializers recursively *)
       let ety = cmp_ty t in
       let compiled = List.map (cmp_gexp c) es in
       let elem_inits =
