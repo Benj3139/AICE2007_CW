@@ -47,11 +47,42 @@ let typ_of_unop : Ast.unop -> Ast.ty * Ast.ty = function
       (Don't forget about OCaml's 'and' keyword.)
 *)
 let rec subtype (c : Tctxt.t) (t1 : Ast.ty) (t2 : Ast.ty) : bool =
-  failwith "todo: subtype"
+  match t1, t2 with
+  | TBool, TBool
+  | TInt, TInt -> true
+  | TRef r1, TRef r2 -> subtype_ref c r1 r2
+  | TRef r1, TNullRef r2 -> subtype_ref c r1 r2
+  | TNullRef r1, TNullRef r2 -> subtype_ref c r1 r2
+  | _, _ -> false
 
 (* Decides whether H |-r ref1 <: ref2 *)
 and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool =
-  failwith "todo: subtype_ref"
+  match t1, t2 with
+  | RString, RString -> true
+  | RArray t1, RArray t2 -> subtype c t1 t2 && subtype c t2 t1
+  | RStruct id1, RStruct id2 ->
+      if id1 = id2 then true
+      else begin
+        match lookup_struct_option id1 c, lookup_struct_option id2 c with
+        | Some fs1, Some fs2 ->
+            List.for_all (fun f2 ->
+              match List.find_opt (fun f1 -> f1.fieldName = f2.fieldName) fs1 with
+              | None -> false
+              | Some f1 -> subtype c f1.ftyp f2.ftyp
+            ) fs2
+        | _ -> false
+      end
+  | RFun (args1, ret1), RFun (args2, ret2) ->
+      List.length args1 = List.length args2
+      && List.for_all2 (fun a2 a1 -> subtype c a2 a1) args2 args1
+      && subtype_ret c ret1 ret2
+  | _, _ -> false
+
+and subtype_ret (c : Tctxt.t) (r1 : Ast.ret_ty) (r2 : Ast.ret_ty) : bool =
+  match r1, r2 with
+  | RetVoid, RetVoid -> true
+  | RetVal t1, RetVal t2 -> subtype c t1 t2
+  | _, _ -> false
 
 
 (* well-formed types -------------------------------------------------------- *)
@@ -70,7 +101,27 @@ and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool =
     - tc contains the structure definition context
  *)
 let rec typecheck_ty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.ty) : unit =
-  failwith "todo: implement typecheck_ty"
+  match t with
+  | TBool | TInt -> ()
+  | TRef rt | TNullRef rt -> typecheck_rty l tc rt
+
+and typecheck_rty (l : 'a Ast.node) (tc : Tctxt.t) (rt : Ast.rty) : unit =
+  match rt with
+  | RString -> ()
+  | RStruct id ->
+      begin match lookup_struct_option id tc with
+      | Some _ -> ()
+      | None -> type_error l ("Unknown struct type: " ^ id)
+      end
+  | RArray t -> typecheck_ty l tc t
+  | RFun (args, r) ->
+      List.iter (typecheck_ty l tc) args;
+      typecheck_ret_ty l tc r
+
+and typecheck_ret_ty (l : 'a Ast.node) (tc : Tctxt.t) (rt : Ast.ret_ty) : unit =
+  match rt with
+  | RetVoid -> ()
+  | RetVal t -> typecheck_ty l tc t
 
 
 (* A helper function to determine whether a type allows the null value *)
@@ -186,7 +237,12 @@ let typecheck_tdecl (tc : Tctxt.t) (id : id) (fs : field list)  (l : 'a Ast.node
     - checks that the function actually returns
 *)
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
-  failwith "todo: typecheck_fdecl"
+  let seen = Hashtbl.create 16 in
+  List.iter (fun (t, id) ->
+    if Hashtbl.mem seen id then type_error l ("Duplicate argument: " ^ id)
+    else (Hashtbl.add seen id true; typecheck_ty l tc t)
+  ) f.args;
+  typecheck_ret_ty l tc f.frtyp
 
 (* creating the typchecking context ----------------------------------------- *)
 
@@ -217,13 +273,39 @@ let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
 *)
 
 let rec create_struct_ctxt (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_struct_ctxt"
+  let with_struct_names =
+    List.fold_left (fun c d ->
+      match d with
+      | Gtdecl ({elt=(id, fs)} as l) ->
+          if lookup_struct_option id c <> None then type_error l ("Duplicate struct: " ^ id)
+          else add_struct c id fs
+      | _ -> c
+    ) empty p
+  in
+  List.iter (fun d ->
+    match d with
+    | Gtdecl ({elt=(id, fs)} as l) -> typecheck_tdecl with_struct_names id fs l
+    | _ -> ()
+  ) p;
+  with_struct_names
 
 let rec create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
+  let tc_with_builtins =
+    List.fold_left (fun c (name, (args, rty)) -> add_global c name (TRef (RFun (args, rty)))) tc builtins
+  in
+  List.fold_left (fun c d ->
+    match d with
+    | Gfdecl ({elt=f} as l) ->
+        if lookup_global_option f.fname c <> None then type_error l ("Duplicate function: " ^ f.fname)
+        else add_global c f.fname (TRef (RFun (List.map fst f.args, f.frtyp)))
+    | _ -> c
+  ) tc_with_builtins p
 
+
+
+  
 let rec create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
+  tc
 
 
 (* This function implements the |- prog and the H ; G |- prog 
