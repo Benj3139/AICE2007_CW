@@ -156,7 +156,38 @@ let is_nullable_ty (t : Ast.ty) : bool =
 
 *)
 let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
-  failwith "todo: implement typecheck_exp"
+  match e.elt with
+  | CInt _ -> TInt
+  | CBool _ -> TBool
+  | CNull r -> TNullRef r
+  | CStr _ -> TRef RString
+  | Lhs l -> fst (typecheck_lhs c l)
+  | CStruct (id, fs) ->
+      begin match lookup_struct_option id c with
+      | None -> type_error e ("Unknown struct: " ^ id)
+      | Some decl_fs ->
+          List.iter (fun (fname, fexp) ->
+            match List.find_opt (fun f -> f.fieldName = fname) decl_fs with
+            | None -> type_error e ("Unknown field: " ^ fname)
+            | Some fdecl ->
+                let te = typecheck_exp c fexp in
+                if not (subtype c te fdecl.ftyp) then type_error e "Bad struct field type"
+          ) fs;
+          TRef (RStruct id)
+      end
+  | Call (fexp, args) ->
+      begin match typecheck_exp c fexp with
+      | TRef (RFun (param_tys, rt))
+      | TNullRef (RFun (param_tys, rt)) ->
+          if List.length args <> List.length param_tys then type_error e "Wrong number of args";
+          List.iter2 (fun a pty ->
+            let aty = typecheck_exp c a in
+            if not (subtype c aty pty) then type_error e "Bad call arg type"
+          ) args param_tys;
+          begin match rt with RetVoid -> type_error e "Void function used as expression" | RetVal t -> t end
+      | _ -> type_error e "Call target is not a function"
+      end
+  | _ -> type_error e "expression form not implemented in this stage"
 
 (* Typechecks a lhs expression in the typing context c.  Returns the
    type of result, along with a boolean flag indicating whether
@@ -169,8 +200,35 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
      pointer (which cannot be written to).
  *)
 and typecheck_lhs (c : Tctxt.t) (l : Ast.lhs node) : Ast.ty * bool =
-  failwith "todo: implement typecheck_lhs"
-
+  match l.elt with
+  | Id id ->
+      begin match lookup_local_option id c with
+      | Some t -> (t, true)
+      | None ->
+          begin match lookup_global_option id c with
+          | Some (TRef (RFun _ ) as t) -> (t, false)
+          | Some t -> (t, true)
+          | None -> type_error l ("Unbound id: " ^ id)
+          end
+      end
+  | Proj (e, fname) ->
+      begin match typecheck_exp c e with
+      | TRef (RStruct sid)
+      | TNullRef (RStruct sid) ->
+          begin match lookup_field_option sid fname c with
+          | Some t -> (t, true)
+          | None -> type_error l ("Unknown field: " ^ fname)
+          end
+      | _ -> type_error l "Projection on non-struct"
+      end
+  | Index (arr, idx) ->
+      let it = typecheck_exp c idx in
+      if it <> TInt then type_error l "Array index must be int";
+      begin match typecheck_exp c arr with
+      | TRef (RArray t)
+      | TNullRef (RArray t) -> (t, true)
+      | _ -> type_error l "Index on non-array"
+      end
 (* statements --------------------------------------------------------------- *)
 
 (* Typecheck a statement 
@@ -209,7 +267,38 @@ and typecheck_lhs (c : Tctxt.t) (l : Ast.lhs node) : Ast.ty * bool =
      block typecheck rules.
 *)
 let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t * bool =
-  failwith "todo: implement typecheck_stmt"
+  match s.elt with
+  | Assn (lhs, rhs) ->
+      let (lt, assignable) = typecheck_lhs tc lhs in
+      if not assignable then type_error s "assignment to non-assignable lhs";
+      let rt = typecheck_exp tc rhs in
+      if not (subtype tc rt lt) then type_error s "assignment type mismatch";
+      (tc, false)
+  | Decl (id, e) ->
+      let t = typecheck_exp tc e in
+      (add_local tc id t, false)
+  | Ret None ->
+      begin match to_ret with
+      | RetVoid -> (tc, true)
+      | RetVal _ -> type_error s "missing return value"
+      end
+  | Ret (Some e) ->
+      let t = typecheck_exp tc e in
+      begin match to_ret with
+      | RetVoid -> type_error s "void function returning value"
+      | RetVal tr -> if not (subtype tc t tr) then type_error s "bad return type" else (tc, true)
+      end
+  | SCall (fexp, args) ->
+      begin match typecheck_exp tc fexp with
+      | TRef (RFun (param_tys, RetVoid))
+      | TNullRef (RFun (param_tys, RetVoid)) ->
+          if List.length args <> List.length param_tys then type_error s "Wrong number of args";
+          List.iter2 (fun a pty -> if not (subtype tc (typecheck_exp tc a) pty) then type_error s "Bad call arg type") args param_tys;
+          (tc, false)
+      | TRef (RFun _) | TNullRef (RFun _) -> type_error s "non-void function used as statement call"
+      | _ -> type_error s "statement call target is not a function"
+      end
+  | _ -> (tc, false)
 
 
 (* struct type declarations ------------------------------------------------- *)
@@ -238,11 +327,22 @@ let typecheck_tdecl (tc : Tctxt.t) (id : id) (fs : field list)  (l : 'a Ast.node
 *)
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
   let seen = Hashtbl.create 16 in
-  List.iter (fun (t, id) ->
-    if Hashtbl.mem seen id then type_error l ("Duplicate argument: " ^ id)
-    else (Hashtbl.add seen id true; typecheck_ty l tc t)
-  ) f.args;
-  typecheck_ret_ty l tc f.frtyp
+  let tc_with_args =
+    List.fold_left (fun c (t, id) ->
+      if Hashtbl.mem seen id then type_error l ("Duplicate argument: " ^ id)
+      else (Hashtbl.add seen id true; typecheck_ty l tc t; add_local c id t)
+    ) tc f.args
+  in
+  typecheck_ret_ty l tc f.frtyp;
+  let _, definitely_returns =
+    List.fold_left (fun (c, retflag) st ->
+      let c2, r = typecheck_stmt c st f.frtyp in
+      (c2, retflag || r)
+    ) (tc_with_args, false) f.body
+  in
+  match f.frtyp with
+  | RetVoid -> ()
+  | RetVal _ -> if not definitely_returns then type_error l ("Function " ^ f.fname ^ " might not return")
 
 (* creating the typchecking context ----------------------------------------- *)
 
@@ -303,7 +403,7 @@ let rec create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
 
 
 
-  
+
 let rec create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
   tc
 
