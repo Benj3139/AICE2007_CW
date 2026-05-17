@@ -129,6 +129,11 @@ let is_nullable_ty (t : Ast.ty) : bool =
   match t with
   | TNullRef _ -> true
   | _ -> false
+(* Helper function that gives the underlying reference type of the nullable type*)
+let typ_of_nullable = function
+  | TNullRef r -> Some (TRef r)
+  | _ -> None
+
 
 (* typechecking expressions ------------------------------------------------- *)
 (* Typechecks an expression in the typing context c, returns the type of the
@@ -166,13 +171,23 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
       begin match lookup_struct_option id c with
       | None -> type_error e ("Unknown struct: " ^ id)
       | Some decl_fs ->
+          let seen = Hashtbl.create 16 in
           List.iter (fun (fname, fexp) ->
+            if Hashtbl.mem seen fname then
+              type_error e ("Duplicate struct field initializer: " ^ fname);
+            Hashtbl.add seen fname true;
             match List.find_opt (fun f -> f.fieldName = fname) decl_fs with
             | None -> type_error e ("Unknown field: " ^ fname)
             | Some fdecl ->
                 let te = typecheck_exp c fexp in
-                if not (subtype c te fdecl.ftyp) then type_error e "Bad struct field type"
+                  if not (subtype c te fdecl.ftyp) then
+                  type_error e "Bad struct field type"
           ) fs;
+
+          List.iter (fun fdecl ->
+            if not (Hashtbl.mem seen fdecl.fieldName) then
+              type_error e ("Missing struct field initializer: " ^ fdecl.fieldName)
+          ) decl_fs;
           TRef (RStruct id)
       end
   | Call (fexp, args) ->
@@ -187,7 +202,47 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
           begin match rt with RetVoid -> type_error e "Void function used as expression" | RetVal t -> t end
       | _ -> type_error e "Call target is not a function"
       end
-  | _ -> type_error e "expression form not implemented in this stage"
+    | Bop (Eq, e1, e2)
+    | Bop (Neq, e1, e2) ->
+        let t1 = typecheck_exp c e1 in
+        let t2 = typecheck_exp c e2 in
+        if subtype c t1 t2 || subtype c t2 t1 then TBool
+        else type_error e "==/!= operands are not compatible"
+    | Bop (b, e1, e2) ->
+        let t1_expected, t2_expected, tret = typ_of_binop b in
+        let t1 = typecheck_exp c e1 in
+        let t2 = typecheck_exp c e2 in
+        if not (subtype c t1 t1_expected) then type_error e "left operand has wrong type";
+        if not (subtype c t2 t2_expected) then type_error e "right operand has wrong type";
+        tret
+    | Uop (u, e1) ->
+        let t_expected, t_ret = typ_of_unop u in
+        let t = typecheck_exp c e1 in
+        if subtype c t t_expected then t_ret else type_error e "unary operand has wrong type"
+    | CArr (elt_t, es) ->
+        typecheck_ty e c elt_t;
+        List.iter (fun ei ->
+          let ti = typecheck_exp c ei in
+          if not (subtype c ti elt_t) then type_error ei "array element has wrong type"
+        ) es;
+        TRef (RArray elt_t)
+    | NewArr (elt_t, size_e) ->
+        typecheck_ty e c elt_t;
+        if typecheck_exp c size_e <> TInt then type_error size_e "array size must be int";
+        if is_nullable_ty elt_t || elt_t = TInt || elt_t = TBool then TRef (RArray elt_t)
+        else type_error e "this array type needs explicit initializer"
+    | NewArrInit (elt_t, size_e, idx, body_e) ->
+        typecheck_ty e c elt_t;
+        if typecheck_exp c size_e <> TInt then type_error size_e "array size must be int";
+        let c_with_idx = add_local c idx TInt in
+        let body_t = typecheck_exp c_with_idx body_e in
+        if not (subtype c body_t elt_t) then type_error e "array initializer has wrong type";
+        TRef (RArray elt_t)
+    | Length e1 ->
+        begin match typecheck_exp c e1 with
+        | TRef (RArray _) | TNullRef (RArray _) -> TInt
+        | _ -> type_error e "length expects an array"
+        end
 
 (* Typechecks a lhs expression in the typing context c.  Returns the
    type of result, along with a boolean flag indicating whether
@@ -229,6 +284,7 @@ and typecheck_lhs (c : Tctxt.t) (l : Ast.lhs node) : Ast.ty * bool =
       | TNullRef (RArray t) -> (t, true)
       | _ -> type_error l "Index on non-array"
       end
+
 (* statements --------------------------------------------------------------- *)
 
 (* Typecheck a statement 
@@ -298,7 +354,53 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       | TRef (RFun _) | TNullRef (RFun _) -> type_error s "non-void function used as statement call"
       | _ -> type_error s "statement call target is not a function"
       end
-  | _ -> (tc, false)
+    | If (g, b1, b2) ->
+      if typecheck_exp tc g <> TBool then type_error g "if guard must be bool";
+      let _, r1 = typecheck_block tc b1 to_ret in
+      let _, r2 = typecheck_block tc b2 to_ret in
+      (tc, r1 && r2)
+  | While (g, body) ->
+      if typecheck_exp tc g <> TBool then type_error g "while guard must be bool";
+      let _, _ = typecheck_block tc body to_ret in
+      (tc, false)
+  | For (inits, guard, after, body) ->
+      let c_with_inits =
+        List.fold_left (fun c_acc (id, e) ->
+          let t = typecheck_exp c_acc e in
+          add_local c_acc id t
+        ) tc inits
+      in
+      begin match guard with
+      | None -> ()
+      | Some g when typecheck_exp c_with_inits g = TBool -> ()
+      | Some g -> type_error g "for guard must be bool"
+      end;
+      begin match after with
+      | None -> ()
+      | Some s_after -> ignore (typecheck_stmt c_with_inits s_after to_ret)
+      end;
+      let _, _ = typecheck_block c_with_inits body to_ret in
+      (tc, false)
+  | Cast (rty, id, exp, notnull_b, null_b) ->
+      let t_exp = typecheck_exp tc exp in
+      begin match t_exp with
+      | TNullRef r when subtype_ref tc r rty ->
+          let tc_notnull = add_local tc id (TRef rty) in
+          let _, r1 = typecheck_block tc_notnull notnull_b to_ret in
+          let _, r2 = typecheck_block tc null_b to_ret in
+          (tc, r1 && r2)
+      | _ -> type_error s "if? expression must be a nullable reference"
+      end
+
+and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : ret_ty) : Tctxt.t * bool =
+  let rec go (c_acc : Tctxt.t) (definitely_returns : bool) (stmts : Ast.block) =
+    match stmts with
+    | [] -> (c_acc, definitely_returns)
+    | st :: rest ->
+        let c_next, returns_here = typecheck_stmt c_acc st to_ret in
+        go c_next (definitely_returns || returns_here) rest
+  in
+  go tc false b
 
 
 (* struct type declarations ------------------------------------------------- *)
@@ -328,22 +430,23 @@ let typecheck_tdecl (tc : Tctxt.t) (id : id) (fs : field list)  (l : 'a Ast.node
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
   let seen = Hashtbl.create 16 in
   let tc_with_args =
-    List.fold_left (fun c (t, id) ->
-      if Hashtbl.mem seen id then type_error l ("Duplicate argument: " ^ id)
-      else (Hashtbl.add seen id true; typecheck_ty l tc t; add_local c id t)
+    List.fold_left (fun c (arg_ty, arg_id) ->
+      if Hashtbl.mem seen arg_id then type_error l ("Duplicate argument: " ^ arg_id);
+      Hashtbl.add seen arg_id true;
+      typecheck_ty l tc arg_ty;
+      add_local c arg_id arg_ty
     ) tc f.args
   in
-  typecheck_ret_ty l tc f.frtyp;
-  let _, definitely_returns =
-    List.fold_left (fun (c, retflag) st ->
-      let c2, r = typecheck_stmt c st f.frtyp in
-      (c2, retflag || r)
-    ) (tc_with_args, false) f.body
-  in
-  match f.frtyp with
-  | RetVoid -> ()
-  | RetVal _ -> if not definitely_returns then type_error l ("Function " ^ f.fname ^ " might not return")
 
+  typecheck_ret_ty l tc f.frtyp;
+
+  let _, definitely_returns = typecheck_block tc_with_args f.body f.frtyp in
+  
+    match f.frtyp with
+  | RetVoid -> ()
+  | RetVal _ ->
+    if not definitely_returns then
+      type_error l ("Function " ^ f.fname ^ " might not return")
 (* creating the typchecking context ----------------------------------------- *)
 
 (* The following functions correspond to the
@@ -405,7 +508,15 @@ let rec create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
 
 
 let rec create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  tc
+  List.fold_left (fun c d ->
+    match d with
+    | Gvdecl ({elt=g} as l) ->
+        if lookup_global_option g.name c <> None then type_error l ("Duplicate global: " ^ g.name)
+        else
+          let t = typecheck_exp c g.init in
+          add_global c g.name t
+    | _ -> c
+  ) tc p
 
 
 (* This function implements the |- prog and the H ; G |- prog 
