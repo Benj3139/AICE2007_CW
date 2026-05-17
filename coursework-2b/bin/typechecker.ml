@@ -171,13 +171,23 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
       begin match lookup_struct_option id c with
       | None -> type_error e ("Unknown struct: " ^ id)
       | Some decl_fs ->
+          let seen = Hashtbl.create 16 in
           List.iter (fun (fname, fexp) ->
+            if Hashtbl.mem seen fname then
+              type_error e ("Duplicate struct field initializer: " ^ fname);
+            Hashtbl.add seen fname true;
             match List.find_opt (fun f -> f.fieldName = fname) decl_fs with
             | None -> type_error e ("Unknown field: " ^ fname)
             | Some fdecl ->
                 let te = typecheck_exp c fexp in
-                if not (subtype c te fdecl.ftyp) then type_error e "Bad struct field type"
+                  if not (subtype c te fdecl.ftyp) then
+                  type_error e "Bad struct field type"
           ) fs;
+
+          List.iter (fun fdecl ->
+            if not (Hashtbl.mem seen fdecl.fieldName) then
+              type_error e ("Missing struct field initializer: " ^ fdecl.fieldName)
+          ) decl_fs;
           TRef (RStruct id)
       end
   | Call (fexp, args) ->
@@ -374,7 +384,7 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
   | Cast (rty, id, exp, notnull_b, null_b) ->
       let t_exp = typecheck_exp tc exp in
       begin match t_exp with
-      | TNullRef r when subtype_ref tc r rty || subtype_ref tc rty r ->
+      | TNullRef r when subtype_ref tc r rty ->
           let tc_notnull = add_local tc id (TRef rty) in
           let _, r1 = typecheck_block tc_notnull notnull_b to_ret in
           let _, r2 = typecheck_block tc null_b to_ret in
@@ -383,10 +393,14 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       end
 
 and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : ret_ty) : Tctxt.t * bool =
-  List.fold_left (fun (c_acc, definitely_returns) st ->
-    let c_next, returns_here = typecheck_stmt c_acc st to_ret in
-    (c_next, definitely_returns || returns_here)
-  ) (tc, false) b
+  let rec go (c_acc : Tctxt.t) (definitely_returns : bool) (stmts : Ast.block) =
+    match stmts with
+    | [] -> (c_acc, definitely_returns)
+    | st :: rest ->
+        let c_next, returns_here = typecheck_stmt c_acc st to_ret in
+        go c_next (definitely_returns || returns_here) rest
+  in
+  go tc false b
 
 
 (* struct type declarations ------------------------------------------------- *)
@@ -416,22 +430,23 @@ let typecheck_tdecl (tc : Tctxt.t) (id : id) (fs : field list)  (l : 'a Ast.node
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
   let seen = Hashtbl.create 16 in
   let tc_with_args =
-    List.fold_left (fun c (t, id) ->
-      if Hashtbl.mem seen id then type_error l ("Duplicate argument: " ^ id)
-      else (Hashtbl.add seen id true; typecheck_ty l tc t; add_local c id t)
+    List.fold_left (fun c (arg_ty, arg_id) ->
+      if Hashtbl.mem seen arg_id then type_error l ("Duplicate argument: " ^ arg_id);
+      Hashtbl.add seen arg_id true;
+      typecheck_ty l tc arg_ty;
+      add_local c arg_id arg_ty
     ) tc f.args
   in
-  typecheck_ret_ty l tc f.frtyp;
-  let _, definitely_returns =
-    List.fold_left (fun (c, retflag) st ->
-      let c2, r = typecheck_stmt c st f.frtyp in
-      (c2, retflag || r)
-    ) (tc_with_args, false) f.body
-  in
-  match f.frtyp with
-  | RetVoid -> ()
-  | RetVal _ -> if not definitely_returns then type_error l ("Function " ^ f.fname ^ " might not return")
 
+  typecheck_ret_ty l tc f.frtyp;
+
+  let _, definitely_returns = typecheck_block tc_with_args f.body f.frtyp in
+  
+    match f.frtyp with
+  | RetVoid -> ()
+  | RetVal _ ->
+    if not definitely_returns then
+      type_error l ("Function " ^ f.fname ^ " might not return")
 (* creating the typchecking context ----------------------------------------- *)
 
 (* The following functions correspond to the
