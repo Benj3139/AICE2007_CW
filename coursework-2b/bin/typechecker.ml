@@ -50,6 +50,7 @@ let rec subtype (c : Tctxt.t) (t1 : Ast.ty) (t2 : Ast.ty) : bool =
   match t1, t2 with
   | TBool, TBool
   | TInt, TInt -> true
+    (* not null reference can be used where a nullable one is expected *)
   | TRef r1, TRef r2 -> subtype_ref c r1 r2
   | TRef r1, TNullRef r2 -> subtype_ref c r1 r2
   | TNullRef r1, TNullRef r2 -> subtype_ref c r1 r2
@@ -175,6 +176,8 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
       begin match lookup_struct_option id c with
       | None -> type_error e ("Unknown struct: " ^ id)
       | Some decl_fs ->
+          (* track fields we've initialized so we can reject duplicates and
+             later ensure all declared fields were provided *)
           let seen = Hashtbl.create 16 in
           List.iter (fun (fname, fexp) ->
             if Hashtbl.mem seen fname then
@@ -392,6 +395,8 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
   | Cast (rty, id, exp, notnull_b, null_b) ->
       let t_exp = typecheck_exp tc exp in
       begin match t_exp with
+      (* if (rty id == exp) is only valid when exp has a nullable ref type
+      and the unwrapped ref type can be safely viewed as rty *)
       | TNullRef r when subtype_ref tc r rty ->
           let tc_notnull = add_local tc id (TRef rty) in
           let _, r1 = typecheck_block tc_notnull notnull_b to_ret in
@@ -401,6 +406,9 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       end
 
 and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : ret_ty) : Tctxt.t * bool =
+    (* we thread two things through a block,
+     first, updated context (new locals from declarations)
+     then, whether we've seen a definitely returning statement so far *)
   let rec go (c_acc : Tctxt.t) (stmts : Ast.block) =
     match stmts with
     | [] -> (c_acc, false)
@@ -440,6 +448,7 @@ let typecheck_tdecl (tc : Tctxt.t) (id : id) (fs : field list)  (l : 'a Ast.node
     - checks that the function actually returns
 *)
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
+ (* seen catches duplicate parameter names in the same function *)
   let seen = Hashtbl.create 16 in
   let tc_with_args =
     List.fold_left (fun c (arg_ty, arg_id) ->
@@ -488,6 +497,8 @@ let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
 *)
 
 let rec create_struct_ctxt (p:Ast.prog) : Tctxt.t =
+  (* this is pass 1, it collects only struct names and raw field declarations so that
+  recursive references between structs can be resolved during WF checking. *)
   let with_struct_names =
     List.fold_left (fun c d ->
       match d with
@@ -497,6 +508,8 @@ let rec create_struct_ctxt (p:Ast.prog) : Tctxt.t =
       | _ -> c
     ) empty p
   in
+  (* pass 2, now that all struct names are known, check each struct declaration
+  for duplicate field names, field type well-formedness, etc *)
   List.iter (fun d ->
     match d with
     | Gtdecl ({elt=(id, fs)} as l) -> typecheck_tdecl with_struct_names id fs l
@@ -505,6 +518,8 @@ let rec create_struct_ctxt (p:Ast.prog) : Tctxt.t =
   with_struct_names
 
 let rec create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
+  (* start from the incoming context and preload built in functions so they are
+  available for calls and for use as first class function pointers *)
   let tc_with_builtins =
     List.fold_left (fun c (name, (args, rty)) -> add_global c name (TRef (RFun (args, rty)))) tc builtins
   in
@@ -520,6 +535,7 @@ let rec create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
 
 
 let rec create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
+    (* Process global value declarations in program order  *)
   List.fold_left (fun c d ->
     match d with
     | Gvdecl ({elt=g} as l) ->
