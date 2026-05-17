@@ -59,7 +59,9 @@ let rec subtype (c : Tctxt.t) (t1 : Ast.ty) (t2 : Ast.ty) : bool =
 and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool =
   match t1, t2 with
   | RString, RString -> true
+
   | RArray t1, RArray t2 -> subtype c t1 t2 && subtype c t2 t1
+
   | RStruct id1, RStruct id2 ->
       if id1 = id2 then true
       else begin
@@ -68,14 +70,16 @@ and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool =
             List.for_all (fun f2 ->
               match List.find_opt (fun f1 -> f1.fieldName = f2.fieldName) fs1 with
               | None -> false
-              | Some f1 -> subtype c f1.ftyp f2.ftyp
+              | Some f1 ->  f1.ftyp = f2.ftyp
             ) fs2
         | _ -> false
       end
+
   | RFun (args1, ret1), RFun (args2, ret2) ->
       List.length args1 = List.length args2
       && List.for_all2 (fun a2 a1 -> subtype c a2 a1) args2 args1
       && subtype_ret c ret1 ret2
+
   | _, _ -> false
 
 and subtype_ret (c : Tctxt.t) (r1 : Ast.ret_ty) (r2 : Ast.ret_ty) : bool =
@@ -192,8 +196,7 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
       end
   | Call (fexp, args) ->
       begin match typecheck_exp c fexp with
-      | TRef (RFun (param_tys, rt))
-      | TNullRef (RFun (param_tys, rt)) ->
+      | TRef (RFun (param_tys, rt)) ->
           if List.length args <> List.length param_tys then type_error e "Wrong number of args";
           List.iter2 (fun a pty ->
             let aty = typecheck_exp c a in
@@ -206,7 +209,7 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
     | Bop (Neq, e1, e2) ->
         let t1 = typecheck_exp c e1 in
         let t2 = typecheck_exp c e2 in
-        if subtype c t1 t2 || subtype c t2 t1 then TBool
+        if subtype c t1 t2 && subtype c t2 t1 then TBool
         else type_error e "==/!= operands are not compatible"
     | Bop (b, e1, e2) ->
         let t1_expected, t2_expected, tret = typ_of_binop b in
@@ -240,7 +243,7 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
         TRef (RArray elt_t)
     | Length e1 ->
         begin match typecheck_exp c e1 with
-        | TRef (RArray _) | TNullRef (RArray _) -> TInt
+        | TRef (RArray _) -> TInt
         | _ -> type_error e "length expects an array"
         end
 
@@ -268,8 +271,7 @@ and typecheck_lhs (c : Tctxt.t) (l : Ast.lhs node) : Ast.ty * bool =
       end
   | Proj (e, fname) ->
       begin match typecheck_exp c e with
-      | TRef (RStruct sid)
-      | TNullRef (RStruct sid) ->
+      | TRef (RStruct sid) ->
           begin match lookup_field_option sid fname c with
           | Some t -> (t, true)
           | None -> type_error l ("Unknown field: " ^ fname)
@@ -280,8 +282,7 @@ and typecheck_lhs (c : Tctxt.t) (l : Ast.lhs node) : Ast.ty * bool =
       let it = typecheck_exp c idx in
       if it <> TInt then type_error l "Array index must be int";
       begin match typecheck_exp c arr with
-      | TRef (RArray t)
-      | TNullRef (RArray t) -> (t, true)
+      | TRef (RArray t) -> (t, true)
       | _ -> type_error l "Index on non-array"
       end
 
@@ -331,8 +332,12 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       if not (subtype tc rt lt) then type_error s "assignment type mismatch";
       (tc, false)
   | Decl (id, e) ->
+    begin match lookup_local_option id tc with
+    | Some _ -> type_error s ("Duplicate local: " ^ id)
+    | None ->
       let t = typecheck_exp tc e in
       (add_local tc id t, false)
+    end
   | Ret None ->
       begin match to_ret with
       | RetVoid -> (tc, true)
@@ -346,8 +351,7 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       end
   | SCall (fexp, args) ->
       begin match typecheck_exp tc fexp with
-      | TRef (RFun (param_tys, RetVoid))
-      | TNullRef (RFun (param_tys, RetVoid)) ->
+      | TRef (RFun (param_tys, RetVoid)) ->
           if List.length args <> List.length param_tys then type_error s "Wrong number of args";
           List.iter2 (fun a pty -> if not (subtype tc (typecheck_exp tc a) pty) then type_error s "Bad call arg type") args param_tys;
           (tc, false)
@@ -366,8 +370,12 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
   | For (inits, guard, after, body) ->
       let c_with_inits =
         List.fold_left (fun c_acc (id, e) ->
-          let t = typecheck_exp c_acc e in
-          add_local c_acc id t
+          begin match lookup_local_option id c_acc with
+          | Some _ -> type_error s ("Duplicate local: " ^ id)
+          | None -> 
+            let t = typecheck_exp c_acc e in
+            add_local c_acc id t
+          end
         ) tc inits
       in
       begin match guard with
@@ -393,14 +401,18 @@ let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.
       end
 
 and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : ret_ty) : Tctxt.t * bool =
-  let rec go (c_acc : Tctxt.t) (definitely_returns : bool) (stmts : Ast.block) =
+  let rec go (c_acc : Tctxt.t) (stmts : Ast.block) =
     match stmts with
-    | [] -> (c_acc, definitely_returns)
+    | [] -> (c_acc, false)
+    | [st] -> typecheck_stmt c_acc st to_ret
     | st :: rest ->
         let c_next, returns_here = typecheck_stmt c_acc st to_ret in
-        go c_next (definitely_returns || returns_here) rest
+        if returns_here then
+          type_error st "early return in block"
+        else
+          go c_next rest
   in
-  go tc false b
+  go tc b
 
 
 (* struct type declarations ------------------------------------------------- *)
